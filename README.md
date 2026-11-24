@@ -16,7 +16,7 @@ classificadas por função, gatilho, alvo e arquétipo, prontas para um LLM mont
 [Instalação](#-instalação) •
 [Uso](#-uso) •
 [Classificação](#-classificação) •
-[Com um LLM](#-usando-com-um-llm) •
+[Com um LLM / MCP](#-usando-com-um-llm) •
 [Desenvolvimento](#-desenvolvimento)
 
 </div>
@@ -29,6 +29,7 @@ classificadas por função, gatilho, alvo e arquétipo, prontas para um LLM mont
 - **Classificação pensada para montar deck.** Cada carta recebe tags em 4 categorias — *removal*, *ramp*, *sacrifice_outlet*, *death_value*, *aristocrats*, *reanimator*... — além de legalidade por formato, preço, rank do EDHREC, Game Changer e identidade de cor.
 - **Busca híbrida.** Filtros exatos + tags + BM25 com stemming (`creatures` casa com `creature`, `died` com `dies`). Aceita consultas em inglês ou português.
 - **Ajuda de deck de Commander.** `deck "<comandante>"` sugere cartas por seção (ramp, compra, remoção, temas do comandante, sinergia, terrenos na cor certa).
+- **Servidor MCP embutido.** `magic_rag mcp` vira ferramenta para Claude e outros LLMs: buscar, ver carta, sugerir e **validar** decks.
 - **Saída JSON** para mandar direto a um LLM (RAG de verdade: ele só responde com cartas reais).
 
 ## 📦 Instalação
@@ -140,6 +141,44 @@ sem texto de lembrete, com o nome da carta trocado por `~` e `creature card` vir
 
 ## 🤖 Usando com um LLM
 
+### Servidor MCP (recomendado)
+
+O executável também é um servidor [MCP](https://modelcontextprotocol.io): `magic_rag mcp`.
+Qualquer cliente MCP (Claude Code, Claude Desktop, Cursor...) passa a ter estas ferramentas:
+
+| ferramenta | o que faz |
+|---|---|
+| `search_cards` | busca com texto + todos os filtros e tags do `search` |
+| `get_card` | ficha completa; se o nome não existir, sugere parecidos (*"tortex" → Tortured Existence*) |
+| `suggest_deck` | sugestões por seção para um comandante |
+| `validate_deck` | confere a lista: cartas inexistentes, legalidade, cópias, identidade de cor, contagem, Game Changers, preço e curva |
+| `list_tags` | a taxonomia com significado e quantidade de cartas |
+
+As cartas e o índice ficam carregados na memória: depois do primeiro segundo, cada consulta é instantânea.
+
+**Claude Code:**
+
+```powershell
+claude mcp add mtg-rag --scope user -- "C:\caminho\para\magic_rag.exe" mcp
+```
+
+Quem clonar este repositório já recebe um `.mcp.json` apontando para `./target/release/magic_rag.exe`:
+basta `cargo build --release`, `magic_rag install` e aprovar o servidor `mtg-rag` ao abrir o `claude` na pasta.
+
+**Claude Desktop** (`claude_desktop_config.json`):
+
+```json
+{
+  "mcpServers": {
+    "mtg-rag": { "command": "C:\\caminho\\para\\magic_rag.exe", "args": ["mcp"] }
+  }
+}
+```
+
+> Rode `magic_rag install` antes, para baixar as cartas. O servidor acha a pasta `data/` ao lado do executável.
+
+### Pela linha de comando
+
 ```
 Você ──(pergunta em português)──▶ LLM ──(filtros + tags)──▶ magic_rag search --json
                                    ▲                                  │
@@ -155,7 +194,8 @@ Você ──(pergunta em português)──▶ LLM ──(filtros + tags)──�
 
 ```
 src/
-  main.rs     linha de comando (install / fetch / build / search / card / deck / tags / stats)
+  main.rs     linha de comando (install / fetch / build / search / card / deck / tags / stats / mcp)
+  mcp.rs      servidor MCP (JSON-RPC 2.0 via stdio)
   fetch.rs    baixa o bulk do Scryfall
   build.rs    bulk -> data/cards.json
   card.rs     structs RawCard (Scryfall) e Card (dataset)

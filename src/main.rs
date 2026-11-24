@@ -9,11 +9,13 @@
 //!   magic_rag deck "<comandante>"       sugestões por categoria para um deck de Commander
 //!   magic_rag tags                      lista a taxonomia de tags e quantas cartas têm cada uma
 //!   magic_rag stats [--json]            métricas da classificação (cobertura, tags por carta)
+//!   magic_rag mcp                       servidor MCP (stdio) para um LLM usar como ferramenta
 
 mod build;
 mod card;
 mod deck;
 mod fetch;
+mod mcp;
 mod search;
 mod tags;
 
@@ -38,6 +40,7 @@ const USAGE: &str = r#"uso:
   magic_rag deck "<comandante>" [--per N] [--budget USD] [--no-game-changers] [--tag T]... [--json]
   magic_rag tags                        lista as tags por categoria
   magic_rag stats [--json]              métricas da classificação (cobertura, tags por carta)
+  magic_rag mcp                         servidor MCP (stdio) para um LLM usar como ferramenta
 
 filtros do search:
   --colors W,U       identidade de cor permitida (C = só incolor)
@@ -126,6 +129,7 @@ fn main() {
         Some("deck") => run_deck(rest),
         Some("tags") => run_tags(),
         Some("stats") => run_stats(rest),
+        Some("mcp") => mcp::run(),
         _ => {
             eprintln!("{USAGE}");
             process::exit(2);

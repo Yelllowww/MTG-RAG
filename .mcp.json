@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "mtg-rag": {
+      "type": "stdio",
+      "command": "./target/release/magic_rag.exe",
+      "args": [
+        "mcp"
+      ],
+      "env": {}
+    }
+  }
+}
