@@ -11,7 +11,8 @@
 
 use crate::card::Card;
 use crate::search::{self, Index, Query, Sort};
-use crate::{deck, tags};
+use crate::rules::{self, RuleHit, RulesDb};
+use crate::{deck, fetch, tags};
 use regex::Regex;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
@@ -36,6 +37,19 @@ impl Db {
 }
 
 static DB: OnceLock<Result<Db, String>> = OnceLock::new();
+static RULES: OnceLock<Result<RulesDb, String>> = OnceLock::new();
+
+fn rules_db() -> Result<&'static RulesDb, String> {
+    RULES
+        .get_or_init(|| {
+            let t = std::time::Instant::now();
+            let r = RulesDb::load(&crate::data_dir())?;
+            eprintln!("[mtg-rag] {} regras e rulings de {} cartas carregados em {:.1}s", r.doc.rules.len(), r.rulings.len(), t.elapsed().as_secs_f64());
+            Ok(r)
+        })
+        .as_ref()
+        .map_err(|e| e.clone())
+}
 
 fn db() -> Result<&'static Db, String> {
     DB.get_or_init(|| {
@@ -68,7 +82,10 @@ const INSTRUCTIONS: &str = "MTG-RAG: busca local sobre todas as cartas de Magic:
 Use estas ferramentas em vez de confiar na memória para texto, legalidade, preço ou existência de cartas. \
 Dicas: (1) o texto de busca funciona melhor com palavras do texto oracle em inglês (ex.: 'sacrifice a creature draw'); \
 (2) combine com filtros e tags — veja list_tags; tags podem ser qualificadas, ex. 'theme:tokens'; \
-(3) sempre rode validate_deck antes de apresentar um deck ao usuário.";
+(3) sempre rode validate_deck antes de apresentar um deck ao usuário. \
+Dúvidas de regra ou de situação de jogo: chame explain_interaction com as cartas envolvidas e a pergunta (traz texto, rulings oficiais, \
+regras das keywords e regras relevantes das Comprehensive Rules); aprofunde com search_rules e get_rule. Rulings oficiais e regras \
+têm prioridade sobre interpretação. Cite os números das regras (ex.: 613.1, 702.19b) para o usuário conferir no PDF.";
 
 // ---------------------------------------------------------------- definição das ferramentas
 
@@ -154,6 +171,56 @@ Sem 'query', ordena por popularidade no EDHREC. Para achar cartas por função, 
                     "no_game_changers": {"type": "boolean", "description": "Trata Game Changers como problema (brackets 1-3 de Commander)."}
                 },
                 "required": ["decklist", "format"]
+            },
+            "annotations": {"readOnlyHint": true, "openWorldHint": false}
+        },
+        {
+            "name": "explain_interaction",
+            "title": "Explicar interação/situação de jogo",
+            "description": "Para dúvidas de regra numa situação de jogo. Junta, para cada carta: texto oracle, rulings oficiais (Wizards) e as Comprehensive Rules das keywords dela; e, se houver 'question', as regras mais relevantes para a pergunta. Também aponta os conceitos de regra que o texto das cartas já indica ('instead' = substituição 614.1a, \"can't\" = 101.2, mudança de tipo = camadas 613.1...). Use o resultado como fonte e cite os números das regras. A pergunta pode ser em português (termos de Magic são traduzidos) ou inglês.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "cards": str_array("Cartas envolvidas (1 a 8 nomes)."),
+                    "question": {"type": "string", "description": "A dúvida, em português ou inglês. Termos de regra ajudam (pilha, camadas, substituição, ações baseadas em estado)."}
+                },
+                "required": ["cards"]
+            },
+            "annotations": {"readOnlyHint": true, "openWorldHint": false}
+        },
+        {
+            "name": "search_rules",
+            "title": "Buscar nas regras",
+            "description": "Busca nas Comprehensive Rules (regras completas oficiais) e no glossário. Aceita português (termos de Magic são traduzidos) ou inglês ('trample assign damage', 'imposto de comandante', 'mulligan', 'camada 4 mudança de tipo'). Verbetes do glossário trazem junto a regra que citam. Um número de regra na consulta ('702.19b') vem primeiro.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 30, "description": "Padrão 8."}
+                },
+                "required": ["query"]
+            },
+            "annotations": {"readOnlyHint": true, "openWorldHint": false}
+        },
+        {
+            "name": "get_rule",
+            "title": "Ler regra pelo número",
+            "description": "Uma regra das Comprehensive Rules pelo número ('613.1', '702.19', '903'), com o contexto acima dela e todas as sub-regras e exemplos. Também aceita um termo do glossário ('Trample').",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"number": {"type": "string", "description": "Número da regra (ex.: '702.19b') ou termo do glossário."}},
+                "required": ["number"]
+            },
+            "annotations": {"readOnlyHint": true, "openWorldHint": false}
+        },
+        {
+            "name": "get_rulings",
+            "title": "Rulings da carta",
+            "description": "Rulings oficiais de uma carta (esclarecimentos da Wizards e do Scryfall, com data), o texto oracle e as regras das keywords dela.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"name": {"type": "string"}},
+                "required": ["name"]
             },
             "annotations": {"readOnlyHint": true, "openWorldHint": false}
         },
@@ -563,9 +630,230 @@ fn list_tags(db: Option<&Db>) -> Value {
     json!({"usage": "Passe em search_cards.tags; use 'categoria:tag' quando o nome repete (ex. 'theme:lifegain').", "categories": cats})
 }
 
+// ---------------------------------------------------------------- regras
+
+fn rule_json(db: &RulesDb, r: &rules::Rule) -> Value {
+    let mut v = json!({"id": r.id, "context": db.breadcrumb(&r.id), "text": r.text});
+    if !r.examples.is_empty() {
+        v["examples"] = json!(r.examples);
+    }
+    v
+}
+
+fn rules_meta(db: &RulesDb) -> Value {
+    json!({
+        "comprehensive_rules_effective": db.doc.effective,
+        // caminho absoluto: o usuário (ou o LLM) precisa achar o arquivo para conferir a regra
+        "pdf": std::path::absolute(crate::data_dir().join(fetch::RULES_PDF))
+            .map_or_else(|_| fetch::RULES_PDF.to_string(), |p| p.display().to_string()),
+    })
+}
+
+fn search_rules(db: &RulesDb, a: &Value) -> Result<Value, String> {
+    let q = s(a, "query").ok_or("informe 'query'")?;
+    let limit = u(a, "limit").unwrap_or(8).clamp(1, 30) as usize;
+    let hits: Vec<Value> = db
+        .search(&q, limit)
+        .into_iter()
+        .map(|(_, h)| match h {
+            RuleHit::Rule(r) => {
+                let mut v = rule_json(db, r);
+                v["type"] = json!("rule");
+                v
+            }
+            RuleHit::Glossary(g) => json!({"type": "glossary", "term": g.term, "text": g.text}),
+        })
+        .collect();
+    Ok(json!({"count": hits.len(), "results": hits, "meta": rules_meta(db)}))
+}
+
+/// Sub-regra sem o "context" (é o mesmo da regra pedida) para não repetir texto.
+fn child_json(r: &rules::Rule) -> Value {
+    let mut v = json!({"id": r.id, "text": r.text});
+    if !r.examples.is_empty() {
+        v["examples"] = json!(r.examples);
+    }
+    v
+}
+
+/// Seções grandes (ex.: 702 tem ~190 keywords) viram um índice: número + título/início.
+const FULL_CHILDREN_MAX: usize = 30;
+
+fn get_rule(db: &RulesDb, a: &Value) -> Result<Value, String> {
+    let raw = s(a, "number").ok_or("informe 'number' (ex.: '702.19b')")?;
+    let Some(id) = rules::find_rule_number(&raw) else {
+        return match db.glossary(&raw) {
+            Some(g) => Ok(json!({
+                "glossary": {"term": g.term, "text": g.text},
+                "see_rules": db.referenced(&g.text).iter().map(|r| {
+                    let mut v = rule_json(db, r);
+                    v["subrules"] = json!(db.children(&r.id).iter().take(FULL_CHILDREN_MAX).map(|c| child_json(c)).collect::<Vec<_>>());
+                    v
+                }).collect::<Vec<_>>(),
+                "meta": rules_meta(db),
+            })),
+            None => Err(format!("'{raw}' não é número de regra nem termo do glossário; tente search_rules")),
+        };
+    };
+    let r = db
+        .get(&id)
+        .ok_or_else(|| format!("a regra {id} não existe nas Comprehensive Rules de {}; tente search_rules", db.doc.effective))?;
+    let children = db.children(&id);
+    let total = children.len();
+    let (subrules, note) = if total > FULL_CHILDREN_MAX {
+        let idx: Vec<Value> = children
+            .iter()
+            .map(|c| {
+                let short: String = c.text.chars().take(90).collect();
+                json!({"id": c.id, "text": if c.text.chars().count() > 90 { format!("{short}…") } else { short }})
+            })
+            .collect();
+        (idx, Some(format!("seção com {total} sub-regras: lista resumida; chame get_rule com o número de uma delas para o texto completo")))
+    } else {
+        (children.iter().map(|c| child_json(c)).collect(), None)
+    };
+    let mut out = json!({
+        "rule": rule_json(db, r),
+        "parents": db.ancestors(&id).iter().map(|p| json!({"id": p.id, "text": p.text})).collect::<Vec<_>>(),
+        "subrule_count": total,
+        "subrules": subrules,
+        "meta": rules_meta(db),
+    });
+    if let Some(n) = note {
+        out["note"] = json!(n);
+    }
+    Ok(out)
+}
+
+fn find_card<'a>(db: &'a Db, name: &str) -> Option<&'a Card> {
+    db.exact(name).or_else(|| search::find_by_name(&db.cards, name).into_iter().next())
+}
+
+/// Carta + rulings + regras das keywords: o pacote de contexto para uma dúvida de regra.
+fn card_rules_json(rdb: &RulesDb, c: &Card) -> Value {
+    let keyword_rules: Vec<Value> = c
+        .keywords
+        .iter()
+        .filter_map(|k| {
+            let r = rdb.keyword_rule(k)?;
+            let first: Vec<String> = rdb.children(&r.id).iter().take(3).map(|x| format!("{} {}", x.id, x.text)).collect();
+            Some(json!({"keyword": k, "rule": r.id, "text": first}))
+        })
+        .collect();
+    json!({
+        "name": c.name, "mana_cost": c.mana_cost, "type_line": c.type_line, "oracle_text": c.oracle_text,
+        "power": c.power, "toughness": c.toughness, "loyalty": c.loyalty, "keywords": c.keywords,
+        "rulings": rdb.rulings_for(&c.oracle_id).iter().map(|r| json!({"date": r.date, "source": r.source, "text": r.text})).collect::<Vec<_>>(),
+        "keyword_rules": keyword_rules,
+    })
+}
+
+fn get_rulings(cards: &Db, rdb: &RulesDb, a: &Value) -> Result<Value, String> {
+    let name = s(a, "name").ok_or("informe 'name'")?;
+    match find_card(cards, &name) {
+        Some(c) => Ok(json!({"card": card_rules_json(rdb, c), "meta": rules_meta(rdb)})),
+        None => Err(format!("carta não encontrada: {name}. Parecidas: {}", suggest_names(cards, &name).join(", "))),
+    }
+}
+
+/// Remove nomes de cartas de uma pergunta (sem diferenciar maiúsculas/acentos).
+fn strip_card_names<'a>(question: &str, names: impl Iterator<Item = &'a str>) -> String {
+    let mut q = search::norm_name(question);
+    let mut ns: Vec<String> = names.map(search::norm_name).filter(|n| n.len() >= 3).collect();
+    ns.sort_by_key(|n| std::cmp::Reverse(n.len()));
+    for n in ns {
+        q = q.replace(&n, " ");
+    }
+    q
+}
+
+/// Conceitos de regra que o texto da carta já denuncia, com a regra que os define.
+/// Ex.: "instead" = efeito de substituição (614.1a); "can't" ganha de "can" (101.2).
+const CONCEPTS: &[(&str, &str, &str)] = &[
+    (r"\binstead\b", "614.1a", "efeito de substituição ('instead')"),
+    (r"\bcan't\b|\bcannot\b", "101.2", "'can't' tem prioridade sobre 'can'"),
+    (r"\b(cast|play) [^.]*from (your|a|their) graveyard|\bcast [^.]*from exile", "601.3", "permissão para conjurar de outra zona"),
+    (r"\bdies\b", "700.4", "o que significa 'dies'"),
+    (r"\bcopy\b|\bcopies\b|\bas a copy\b", "707.2", "o que uma cópia copia"),
+    (r"\bwhen(ever)? [^.]*\benters\b", "603.6a", "habilidade de entrar no campo"),
+    (
+        r"lose all abilities|\bbase power\b|in addition to (its|their) other types|\b(lands|creatures|permanents) are [a-z]+s\b|nonbasic lands are|\bis an? [a-z]+ (creature|land)\b",
+        "613.1",
+        "efeito contínuo que muda tipo/habilidades/P/R: sistema de camadas",
+    ),
+];
+
+fn concept_rules(rdb: &RulesDb, cards: &[&Card]) -> Vec<Value> {
+    static RES: OnceLock<Vec<Regex>> = OnceLock::new();
+    let res = RES.get_or_init(|| CONCEPTS.iter().map(|(p, _, _)| Regex::new(p).unwrap()).collect());
+    let mut out = vec![];
+    for ((_, id, why), re) in CONCEPTS.iter().zip(res) {
+        let hits: Vec<&str> = cards.iter().filter(|c| re.is_match(&c.oracle_text.to_lowercase())).map(|c| c.name.as_str()).collect();
+        if hits.is_empty() {
+            continue;
+        }
+        if let Some(r) = rdb.get(id) {
+            let mut v = rule_json(rdb, r);
+            v["why"] = json!(format!("{why} — em {}", hits.join(", ")));
+            out.push(v);
+        }
+    }
+    out
+}
+
+fn explain_interaction(cards: &Db, rdb: &RulesDb, a: &Value) -> Result<Value, String> {
+    let names = list(a, "cards");
+    if names.is_empty() || names.len() > 8 {
+        return Err("informe de 1 a 8 cartas em 'cards'".into());
+    }
+    let mut found = vec![];
+    let mut found_cards: Vec<&Card> = vec![];
+    let mut unknown = vec![];
+    for n in &names {
+        match find_card(cards, n) {
+            Some(c) => {
+                found.push(card_rules_json(rdb, c));
+                found_cards.push(c);
+            }
+            None => unknown.push(json!({"name": n, "suggestions": suggest_names(cards, n)})),
+        }
+    }
+    // Os nomes das cartas atrapalham a busca nas regras ("Rest in Peace" casa com
+    // "for the rest of the game", de Epic): tiramos antes de buscar.
+    let related: Vec<Value> = s(a, "question")
+        .map(|q| {
+            let q = strip_card_names(&q, names.iter().map(String::as_str).chain(found_cards.iter().flat_map(|c| c.name.split(" // "))));
+            rdb.search(&q, 8)
+                .into_iter()
+                .map(|(_, h)| match h {
+                    RuleHit::Rule(r) => rule_json(rdb, r),
+                    RuleHit::Glossary(g) => json!({"glossary": g.term, "text": g.text}),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(json!({
+        "cards": found,
+        "unknown": unknown,
+        "concept_rules": concept_rules(rdb, &found_cards),
+        "related_rules": related,
+        "how_to_answer": "Responda com base nesses textos: rulings oficiais e regras têm prioridade sobre interpretação. Cite os números das regras. Se faltar uma regra (ex.: camadas 613, efeitos de substituição 614, pilha 405, ações baseadas em estado 704), busque com search_rules ou leia com get_rule.",
+        "meta": rules_meta(rdb),
+    }))
+}
+
 fn call_tool(name: &str, args: &Value) -> Result<Value, String> {
     if name == "list_tags" {
         return Ok(list_tags(db().ok()));
+    }
+    let rules_err = |e: String| format!("regras indisponíveis: {e}");
+    let cards_err = |e: String| format!("base de cartas indisponível: {e}");
+    match name {
+        "search_rules" => return search_rules(rules_db().map_err(rules_err)?, args),
+        "get_rule" => return get_rule(rules_db().map_err(rules_err)?, args),
+        "get_rulings" => return get_rulings(db().map_err(cards_err)?, rules_db().map_err(rules_err)?, args),
+        "explain_interaction" => return explain_interaction(db().map_err(cards_err)?, rules_db().map_err(rules_err)?, args),
+        _ => {}
     }
     let db = db().map_err(|e| format!("base de cartas indisponível: {e}"))?;
     match name {
@@ -627,6 +915,11 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("[mtg-rag] aviso: {e}");
         }
     });
+    std::thread::spawn(|| {
+        if let Err(e) = rules_db() {
+            eprintln!("[mtg-rag] aviso: {e}");
+        }
+    });
     let stdin = io::stdin();
     let mut out = io::stdout().lock();
     for line in stdin.lock().lines() {
@@ -664,7 +957,10 @@ mod tests {
 
         let r = handle(&json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})).unwrap();
         let names: Vec<&str> = r["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert_eq!(names, ["search_cards", "get_card", "suggest_deck", "validate_deck", "list_tags"]);
+        assert_eq!(
+            names,
+            ["search_cards", "get_card", "suggest_deck", "validate_deck", "explain_interaction", "search_rules", "get_rule", "get_rulings", "list_tags"]
+        );
         for t in r["result"]["tools"].as_array().unwrap() {
             assert_eq!(t["inputSchema"]["type"], "object", "{}", t["name"]);
         }
@@ -727,6 +1023,26 @@ mod tests {
         assert_eq!(copy_limit(&rats, "commander", true), None);
         let dwarves = mk("Seven Dwarves", &[], "Seven Dwarves gets +1/+1 for each other creature named Seven Dwarves you control.\nA deck can have up to seven cards named Seven Dwarves.", &[]);
         assert_eq!(copy_limit(&dwarves, "legacy", false), Some(7));
+    }
+
+    #[test]
+    fn card_names_are_stripped_from_rule_questions() {
+        let q = strip_card_names("Se Rest in Peace está em campo, posso conjurar Gravecrawler?", ["Rest in Peace", "Gravecrawler"].into_iter());
+        assert!(!q.contains("rest") && !q.contains("peace") && !q.contains("gravecrawler"), "{q}");
+        assert!(q.contains("conjurar") && q.contains("campo"));
+    }
+
+    #[test]
+    fn concept_patterns_match_card_text() {
+        let find = |text: &str| -> Vec<&str> {
+            CONCEPTS.iter().filter(|(p, _, _)| Regex::new(p).unwrap().is_match(&text.to_lowercase())).map(|(_, id, _)| *id).collect()
+        };
+        assert_eq!(find("If a card or token would be put into a graveyard from anywhere, exile it instead."), ["614.1a"]);
+        assert_eq!(find("You may cast this card from your graveyard as long as you control a Zombie."), ["601.3"]);
+        assert_eq!(find("Nonbasic lands are Mountains."), ["613.1"]);
+        assert_eq!(find("All creatures lose all abilities and have base power and toughness 1/1."), ["613.1"]);
+        assert_eq!(find("Your opponents can't cast spells during your turn."), ["101.2"]);
+        assert!(find("Flying").is_empty());
     }
 
     #[test]

@@ -84,7 +84,7 @@ fn mcp_end_to_end() {
 
     // ---- protocolo
     let tools = s.rpc("tools/list", json!({}));
-    assert_eq!(tools["result"]["tools"].as_array().unwrap().len(), 5);
+    assert_eq!(tools["result"]["tools"].as_array().unwrap().len(), 9);
     assert_eq!(s.rpc("ping", json!({}))["result"], json!({}));
     s.send_raw("{não é json");
     assert_eq!(s.read()["error"]["code"], -32700);
@@ -160,6 +160,66 @@ fn mcp_end_to_end() {
 
     let d = s.tool("validate_deck", json!({"decklist": "1 Counterspell\n98 Mountain", "format": "commander", "commander": "Krenko, Mob Boss"})).unwrap();
     assert!(problems(&d).contains("identidade de cor"), "{}", problems(&d));
+
+    // ---- regras (Comprehensive Rules + rulings)
+    if Path::new("data/rules.json").is_file() {
+        let d = s.tool("get_rule", json!({"number": "702.19b"})).unwrap();
+        assert!(d["rule"]["text"].as_str().unwrap().contains("trample"));
+        assert_eq!(d["rule"]["context"], "7 Additional Rules › 702 Keyword Abilities › 702.19 Trample");
+        assert!(d["meta"]["pdf"].as_str().unwrap().ends_with("comprehensive-rules.pdf"));
+
+        let d = s.tool("get_rule", json!({"number": "regra 702.19"})).unwrap();
+        assert!(d["subrules"].as_array().unwrap().len() >= 3, "sub-regras de 702.19");
+        let d = s.tool("get_rule", json!({"number": "Trample"})).unwrap();
+        assert!(d["glossary"]["text"].as_str().unwrap().contains("702.19"));
+        assert!(s.tool("get_rule", json!({"number": "999.9"})).is_err());
+
+        let d = s.tool("search_rules", json!({"query": "commander damage 21 combat damage loses", "limit": 3})).unwrap();
+        let ids: Vec<&str> = d["results"].as_array().unwrap().iter().filter_map(|r| r["id"].as_str()).collect();
+        assert!(ids.iter().any(|i| *i == "903.10a" || *i == "704.6c"), "dano de comandante: {ids:?}");
+
+        // achados nos testes da v0.4.0 com o MCP de verdade
+        let d = s.tool("search_rules", json!({"query": "imposto de comandante custo adicional zona de comando", "limit": 3})).unwrap();
+        assert!(d["results"].to_string().contains("903.8"), "busca em português: {}", d["results"]);
+        let d = s.tool("search_rules", json!({"query": "London mulligan put cards on bottom", "limit": 4})).unwrap();
+        assert!(d["results"].to_string().contains("\"103.5\""), "glossário traz a regra citada: {}", d["results"]);
+        let d = s.tool("get_rule", json!({"number": "702"})).unwrap();
+        assert!(d["subrule_count"].as_u64().unwrap() > 150);
+        assert_eq!(d["subrules"].as_array().unwrap().len() as u64, d["subrule_count"].as_u64().unwrap(), "sem cortar a lista");
+        assert!(d["note"].is_string());
+        let d = s.tool("get_rule", json!({"number": "Hexproof"})).unwrap();
+        assert_eq!(d["see_rules"][0]["id"], "702.11", "glossário traz a regra");
+        let d = s.tool("get_rule", json!({"number": "613.8"})).unwrap();
+        assert!(d["subrules"][0].get("context").is_none(), "sub-regra sem contexto repetido");
+        assert!(Path::new(d["meta"]["pdf"].as_str().unwrap()).is_absolute(), "caminho do PDF absoluto");
+
+        // pergunta em português com nomes de cartas: os nomes não podem poluir a busca
+        let d = s.tool("explain_interaction", json!({
+            "cards": ["Rest in Peace", "Gravecrawler"],
+            "question": "se Rest in Peace está em campo, posso conjurar Gravecrawler do cemitério?"
+        })).unwrap();
+        let concepts = d["concept_rules"].to_string();
+        assert!(concepts.contains("614.1a") && concepts.contains("601.3"), "conceitos das cartas: {concepts}");
+        let related = d["related_rules"].to_string();
+        assert!(!related.contains("702.50"), "'Rest in Peace' não pode puxar Epic ('rest of the game'): {related}");
+
+        let d = s.tool("get_rulings", json!({"name": "Blood Moon"})).unwrap();
+        assert!(d["card"]["rulings"].to_string().contains("before it can trigger"));
+
+        let d = s.tool("explain_interaction", json!({
+            "cards": ["Blood Moon", "Urborg, Tomb of Yawgmoth", "Stinkweed Imp", "Cartinha Inventada"],
+            "question": "layers type-changing ability-removing effects dependency"
+        })).unwrap();
+        assert_eq!(d["cards"].as_array().unwrap().len(), 3);
+        assert_eq!(d["unknown"][0]["name"], "Cartinha Inventada");
+        let imp = &d["cards"][2];
+        let kw: Vec<&str> = imp["keyword_rules"].as_array().unwrap().iter().map(|k| k["rule"].as_str().unwrap()).collect();
+        assert!(kw.contains(&"702.52") && kw.contains(&"702.9"), "dredge e flying: {kw:?}");
+        let related = d["related_rules"].to_string();
+        assert!(related.contains("\"613."), "camadas (613) para a pergunta de mudança de tipo: {related}");
+    } else {
+        eprintln!("AVISO: data/rules.json não existe; testes de regras pulados.");
+    }
 
     // ---- desempenho: a lista de 1000 linhas usava 11 s antes do índice de nomes
     let big: String = (0..1000).map(|i| format!("1 {}\n", ["Sol Ring", "Dark Ritual"][i % 2])).collect();

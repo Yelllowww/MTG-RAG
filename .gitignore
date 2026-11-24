@@ -4,3 +4,6 @@
 # dataset: não vai para o repositório, é gerado com `magic_rag install`
 /data/
 *.part
+
+# configuração local do Claude Code (aprovação do servidor MCP)
+.claude/settings.local.json

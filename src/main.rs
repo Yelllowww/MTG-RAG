@@ -2,13 +2,16 @@
 //!
 //! Comandos:
 //!   magic_rag install                   fetch + build (também roda no duplo clique sem dados)
-//!   magic_rag fetch                    baixa o bulk "Oracle Cards" do Scryfall para data/
-//!   magic_rag build                     gera data/cards.json (tags, texto de busca)
+//!   magic_rag fetch                     baixa cartas, rulings e Comprehensive Rules para data/
+//!   magic_rag build                     gera data/cards.json, rules.json e rulings.json
 //!   magic_rag search "<texto>" [filtros]
 //!   magic_rag card "<nome>"             ficha completa de uma carta
 //!   magic_rag deck "<comandante>"       sugestões por categoria para um deck de Commander
 //!   magic_rag tags                      lista a taxonomia de tags e quantas cartas têm cada uma
 //!   magic_rag stats [--json]            métricas da classificação (cobertura, tags por carta)
+//!   magic_rag rules "<texto>"           busca nas Comprehensive Rules
+//!   magic_rag rule <número>             uma regra (ex.: 702.19b) com contexto e sub-regras
+//!   magic_rag rulings "<carta>"         rulings oficiais de uma carta
 //!   magic_rag mcp                       servidor MCP (stdio) para um LLM usar como ferramenta
 
 mod build;
@@ -16,6 +19,7 @@ mod card;
 mod deck;
 mod fetch;
 mod mcp;
+mod rules;
 mod search;
 mod tags;
 
@@ -28,18 +32,20 @@ use std::io::BufReader;
 use std::path::PathBuf;
 use std::{env, process};
 
-const RAW_FILE: &str = "scryfall-oracle-cards.jsonl.gz";
 const CARDS_FILE: &str = "cards.json";
 
 const USAGE: &str = r#"uso:
-  magic_rag install                     baixa e prepara todas as cartas (fetch + build)
-  magic_rag fetch                       baixa todas as cartas do Scryfall (~25 MB comprimido)
-  magic_rag build                       gera data/cards.json
+  magic_rag install                     baixa e prepara cartas, rulings e regras (fetch + build)
+  magic_rag fetch                       baixa cartas e rulings (Scryfall) e as Comprehensive Rules (Wizards)
+  magic_rag build                       gera data/cards.json, rules.json e rulings.json
   magic_rag search "<texto>" [filtros]  busca cartas
   magic_rag card "<nome>" [--json]      ficha completa
   magic_rag deck "<comandante>" [--per N] [--budget USD] [--no-game-changers] [--tag T]... [--json]
   magic_rag tags                        lista as tags por categoria
   magic_rag stats [--json]              métricas da classificação (cobertura, tags por carta)
+  magic_rag rules "<texto>" [--top N]   busca nas Comprehensive Rules (aceita número: "702.19b")
+  magic_rag rule <número>               regra com contexto e sub-regras (ex.: 613.1, 702.19)
+  magic_rag rulings "<carta>"           rulings oficiais de uma carta
   magic_rag mcp                         servidor MCP (stdio) para um LLM usar como ferramenta
 
 filtros do search:
@@ -68,7 +74,7 @@ filtros do search:
 dados: pasta data/ (ou a variável MAGIC_RAG_DATA)"#;
 
 /// Pasta de dados: $MAGIC_RAG_DATA, ./data, ou data/ ao lado do projeto do executável.
-fn data_dir() -> PathBuf {
+pub(crate) fn data_dir() -> PathBuf {
     if let Ok(d) = env::var("MAGIC_RAG_DATA") {
         return PathBuf::from(d);
     }
@@ -119,11 +125,11 @@ fn main() {
             let _ = std::io::stdin().read_line(&mut String::new());
             process::exit(if r.is_ok() { 0 } else { 1 });
         }
-        Some("fetch") => fetch::run(&rest.first().cloned().unwrap_or_else(|| data_file(RAW_FILE))),
-        Some("build") => build::run(
-            &rest.first().cloned().unwrap_or_else(|| data_file(RAW_FILE)),
-            &rest.get(1).cloned().unwrap_or_else(|| data_file(CARDS_FILE)),
-        ),
+        Some("fetch") => fetch::run_all(&data_dir()),
+        Some("build") => build_all(),
+        Some("rules") => run_rules_search(rest),
+        Some("rule") => run_rule(rest),
+        Some("rulings") => run_rulings(rest),
         Some("search") => run_search(rest),
         Some("card") => run_card(rest),
         Some("deck") => run_deck(rest),
@@ -145,14 +151,95 @@ fn csv_upper(s: &str) -> Vec<String> {
     s.to_uppercase().split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty() && x != "C").collect()
 }
 
-/// Baixa todas as cartas do Scryfall e gera o dataset local (fetch + build).
+/// Baixa cartas, rulings e regras e gera os arquivos locais (fetch + build).
 fn install() -> Result<(), Box<dyn Error>> {
-    let raw = data_file(RAW_FILE);
-    let cards = data_file(CARDS_FILE);
-    println!("== Instalando as cartas do Magic em {}", data_dir().display());
-    fetch::run(&raw)?;
-    build::run(&raw, &cards)?;
-    println!("\nPronto! Experimente:\n  magic_rag search \"\" --tag removal --format commander\n  magic_rag card \"Sol Ring\"");
+    let dir = data_dir();
+    println!("== Instalando cartas, rulings e regras do Magic em {}", dir.display());
+    fetch::run_all(&dir)?;
+    build_all()?;
+    println!(
+        "\nPronto! Experimente:\n  magic_rag search \"\" --tag removal --format commander\n  magic_rag card \"Sol Ring\"\n  magic_rag rule 702.19\n\nPDF das regras (para conferir pelo número): {}",
+        dir.join(fetch::RULES_PDF).display()
+    );
+    Ok(())
+}
+
+fn build_all() -> Result<(), Box<dyn Error>> {
+    build::run(&data_file(fetch::CARDS_RAW), &data_file(CARDS_FILE))?;
+    rules::build(&data_dir())
+}
+
+fn load_rules() -> Result<rules::RulesDb, Box<dyn Error>> {
+    Ok(rules::RulesDb::load(&data_dir())?)
+}
+
+fn run_rules_search(args: &[String]) -> Result<(), Box<dyn Error>> {
+    let mut top = 8;
+    let mut query = String::new();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--top" => top = it.next().ok_or("faltou valor para --top")?.parse()?,
+            s => query = s.to_string(),
+        }
+    }
+    let db = load_rules()?;
+    for (_, hit) in db.search(&query, top) {
+        match hit {
+            rules::RuleHit::Rule(r) => {
+                println!("[{}] {}", r.id, db.breadcrumb(&r.id));
+                println!("    {}\n", r.text.replace('\n', "\n    "));
+            }
+            rules::RuleHit::Glossary(g) => println!("[glossário] {}\n    {}\n", g.term, g.text.replace('\n', "\n    ")),
+        }
+    }
+    Ok(())
+}
+
+fn run_rule(args: &[String]) -> Result<(), Box<dyn Error>> {
+    let raw = args.join(" ");
+    let db = load_rules()?;
+    let Some(id) = rules::find_rule_number(&raw) else {
+        if let Some(g) = db.glossary(&raw) {
+            println!("[glossário] {}\n{}", g.term, g.text);
+            return Ok(());
+        }
+        return Err(format!("informe o número da regra (ex.: 702.19b) ou um termo do glossário: {raw}").into());
+    };
+    let r = db.get(&id).ok_or_else(|| format!("regra {id} não existe (Comprehensive Rules de {})", db.doc.effective))?;
+    println!("{}\n", db.breadcrumb(&id));
+    println!("{} {}", r.id, r.text);
+    for ex in &r.examples {
+        println!("  Exemplo: {}", ex.replace('\n', "\n  "));
+    }
+    for c in db.children(&id) {
+        println!("\n{} {}", c.id, c.text);
+        for ex in &c.examples {
+            println!("  Exemplo: {}", ex.replace('\n', "\n  "));
+        }
+    }
+    println!("\n(Comprehensive Rules em vigor desde {}; PDF: {})", db.doc.effective, data_file(fetch::RULES_PDF));
+    Ok(())
+}
+
+fn run_rulings(args: &[String]) -> Result<(), Box<dyn Error>> {
+    let name = args.iter().find(|a| !a.starts_with("--")).ok_or("informe o nome da carta")?;
+    let cards = load_cards()?;
+    let card = search::find_by_name(&cards, name).into_iter().next().ok_or_else(|| format!("carta não encontrada: {name}"))?;
+    let db = load_rules()?;
+    println!("{}  {}\n{}\n{}\n", card.name, card.mana_cost, card.type_line, card.oracle_text);
+    let rs = db.rulings_for(&card.oracle_id);
+    if rs.is_empty() {
+        println!("(sem rulings oficiais)");
+    }
+    for r in rs {
+        println!("- [{} {}] {}", r.date, r.source, r.text);
+    }
+    for k in &card.keywords {
+        if let Some(r) = db.keyword_rule(k) {
+            println!("\nRegra da keyword {k}: {} — magic_rag rule {}", r.text, r.id);
+        }
+    }
     Ok(())
 }
 

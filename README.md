@@ -2,20 +2,22 @@
 
 <img src="assets/banner.jpg" alt="MTG-RAG" width="100%">
 
-# 🃏 MTG-RAG
+# MTG-RAG
 
-**Busca local sobre todas as ~36 mil cartas de Magic: The Gathering —<br>
-classificadas por função, gatilho, alvo e arquétipo, prontas para um LLM montar decks.**
+**Busca local sobre todas as ~36 mil cartas de Magic: The Gathering e as regras oficiais do jogo —<br>
+classificadas por função, gatilho, alvo e arquétipo, prontas para um LLM montar decks e responder dúvidas de regra.**
 
 ![Rust](https://img.shields.io/badge/Rust-2024-orange?logo=rust)
 ![Cartas](https://img.shields.io/badge/cartas-35.892-6f42c1)
 ![Tags](https://img.shields.io/badge/tags-112-2ea44f)
-![Dados](https://img.shields.io/badge/dados-Scryfall-1f6feb)
+![Regras](https://img.shields.io/badge/regras-3.340-c2410c)
+![Dados](https://img.shields.io/badge/dados-Scryfall%20%2B%20Wizards-1f6feb)
 ![Offline](https://img.shields.io/badge/roda-100%25%20local-black)
 
 [Instalação](#-instalação) •
 [Uso](#-uso) •
 [Classificação](#-classificação) •
+[Regras](#-regras-do-jogo) •
 [Com um LLM / MCP](#-usando-com-um-llm) •
 [Desenvolvimento](#-desenvolvimento)
 
@@ -23,13 +25,14 @@ classificadas por função, gatilho, alvo e arquétipo, prontas para um LLM mont
 
 ---
 
-## ✨ O que faz
+## 🔮 O que faz
 
 - **Todas as cartas, no seu computador.** Baixa o bulk *Oracle Cards* do Scryfall (~25 MB) e gera um dataset local. Depois disso, nada de internet.
 - **Classificação pensada para montar deck.** Cada carta recebe tags em 4 categorias — *removal*, *ramp*, *sacrifice_outlet*, *death_value*, *aristocrats*, *reanimator*... — além de legalidade por formato, preço, rank do EDHREC, Game Changer e identidade de cor.
 - **Busca híbrida.** Filtros exatos + tags + BM25 com stemming (`creatures` casa com `creature`, `died` com `dies`). Aceita consultas em inglês ou português.
 - **Ajuda de deck de Commander.** `deck "<comandante>"` sugere cartas por seção (ramp, compra, remoção, temas do comandante, sinergia, terrenos na cor certa).
-- **Servidor MCP embutido.** `magic_rag mcp` vira ferramenta para Claude e outros LLMs: buscar, ver carta, sugerir e **validar** decks.
+- **Regras do jogo.** As *Comprehensive Rules* oficiais (3.340 regras + glossário) e os *rulings* de 20 mil cartas, para responder dúvidas de situação de jogo citando o número da regra. O [PDF das regras](docs/MagicCompRules-20261106.pdf) vem junto, para conferir.
+- **Servidor MCP embutido.** `magic_rag mcp` vira ferramenta para Claude e outros LLMs: buscar, ver carta, sugerir e **validar** decks, e **explicar interações** com as regras oficiais.
 - **Saída JSON** para mandar direto a um LLM (RAG de verdade: ele só responde com cartas reais).
 
 ## 📦 Instalação
@@ -37,13 +40,16 @@ classificadas por função, gatilho, alvo e arquétipo, prontas para um LLM mont
 ### Opção 1 — executável (Windows)
 
 1. Baixe o `magic_rag.exe` na página de [**Releases**](../../releases).
-2. Coloque numa pasta e **dê dois cliques**. Ele baixa e prepara todas as cartas sozinho:
+2. Coloque numa pasta e **dê dois cliques**. Ele baixa e prepara cartas, rulings e regras sozinho:
 
 ```
-== Instalando as cartas do Magic em data
-baixando Oracle Cards (~26 MB)...
-39412 entradas lidas, 35892 cartas jogáveis
+== Instalando cartas, rulings e regras do Magic em data
+baixando cartas (Oracle Cards) (~26 MB)...
+baixando rulings das cartas (~6 MB)...
+baixando Comprehensive Rules (MagicCompRules 20261106.txt)...
 35892 cartas salvas em data\cards.json (2.3s)
+3340 regras e 744 verbetes de glossário (em vigor desde November 6, 2026)
+80928 rulings de 20387 cartas
 Pronto!
 ```
 
@@ -139,12 +145,42 @@ A classificação é feita por regras (regex + lógica) sobre o texto oracle nor
 sem texto de lembrete, com o nome da carta trocado por `~` e `creature card` virando
 `creature_card` (para não confundir "exile target creature" com "exile target creature card from a graveyard").
 
+## 📖 Regras do jogo
+
+Para dúvidas de **situação de jogo** ("Blood Moon desliga o Urborg?", "dredge com 3 cartas no grimório?",
+"dano de comandante roubado conta?"), o MTG-RAG usa só fontes oficiais:
+
+| fonte | o que responde | de onde vem |
+|---|---|---|
+| **Comprehensive Rules** | como o jogo funciona: camadas, pilha, combate, cada keyword | [Wizards](https://magic.wizards.com/en/rules), baixadas pelo `install` |
+| **Rulings** | esclarecimentos oficiais sobre cartas específicas | [Scryfall](https://scryfall.com/docs/api/bulk-data) (Wizards + Scryfall) |
+
+```powershell
+& $m rule 702.19                 # trample: contexto, sub-regras e exemplos
+& $m rule 613.1                  # camadas
+& $m rules "commander damage 21" # busca por texto (melhor em inglês, com termos de regra)
+& $m rulings "Blood Moon"        # rulings oficiais da carta
+```
+
+**Conferir uma regra pelo número:** o PDF oficial está em
+[`docs/MagicCompRules-20261106.pdf`](docs/MagicCompRules-20261106.pdf) (e o `install` baixa a versão mais nova
+em `data/comprehensive-rules.pdf`). Abra e procure pelo número (Ctrl+F `702.19b`).
+
+Com o servidor MCP, o LLM chama `explain_interaction` com as cartas e a pergunta (em português ou inglês) e responde
+**citando os números das regras e os rulings**. A ferramenta também aponta os conceitos de regra que o texto das cartas
+já indica, por exemplo *"instead"* (efeito de substituição, 614.1a) ou *"can't"* (101.2). Em três rodadas de teste com
+17 dúvidas clássicas, de trample + deathtouch até Humility + Opalescence (camadas) e Platinum Angel + Abyssal
+Persecutor, as 17 respostas vieram certas e com as regras corretas.
+
+> As regras são atualizadas pela Wizards a cada coleção (~4 vezes por ano). Rode `magic_rag install` de novo para
+> atualizar; o arquivo em `docs/` é a versão de 06/11/2026.
+
 ## 🤖 Usando com um LLM
 
 ### Servidor MCP (recomendado)
 
 O executável também é um servidor [MCP](https://modelcontextprotocol.io): `magic_rag mcp`.
-Qualquer cliente MCP (Claude Code, Claude Desktop, Cursor...) passa a ter estas ferramentas:
+Qualquer cliente MCP (Claude Code, Claude Desktop, Cursor...) passa a ter estas 9 ferramentas:
 
 | ferramenta | o que faz |
 |---|---|
@@ -152,6 +188,10 @@ Qualquer cliente MCP (Claude Code, Claude Desktop, Cursor...) passa a ter estas 
 | `get_card` | ficha completa; ignora acentos e apóstrofos (*Lim-Dul's Vault*, *Thassa’s Oracle*) e, se o nome não existir, sugere parecidos (*"tortex" → Tortured Existence*) |
 | `suggest_deck` | sugestões por seção para um comandante |
 | `validate_deck` | confere a lista: cartas inexistentes (com sugestão), legalidade, cópias (inclusive restritas e Seven Dwarves), identidade de cor, contagem, Game Changers, orçamento por carta, preço e curva. Aceita listas do Arena, MTGO (`SB:`) e Moxfield |
+| `explain_interaction` | **dúvida de regra**: junta texto, rulings oficiais e regras das keywords de cada carta, mais as regras relevantes para a pergunta |
+| `search_rules` | busca nas Comprehensive Rules e no glossário (aceita número: `702.19b`) |
+| `get_rule` | uma regra pelo número, com contexto, sub-regras e exemplos |
+| `get_rulings` | rulings oficiais de uma carta |
 | `list_tags` | a taxonomia com significado e quantidade de cartas |
 
 As cartas e o índice ficam carregados na memória: depois do primeiro segundo, cada consulta é instantânea.
@@ -175,7 +215,7 @@ basta `cargo build --release`, `magic_rag install` e aprovar o servidor `mtg-rag
 }
 ```
 
-> Rode `magic_rag install` antes, para baixar as cartas. O servidor acha a pasta `data/` ao lado do executável.
+> Rode `magic_rag install` antes, para baixar cartas, rulings e regras. O servidor acha a pasta `data/` ao lado do executável.
 
 ### Pela linha de comando
 
@@ -196,6 +236,7 @@ Você ──(pergunta em português)──▶ LLM ──(filtros + tags)──�
 src/
   main.rs     linha de comando (install / fetch / build / search / card / deck / tags / stats / mcp)
   mcp.rs      servidor MCP (JSON-RPC 2.0 via stdio)
+  rules.rs    Comprehensive Rules (parser, hierarquia, busca) e rulings por carta
   fetch.rs    baixa o bulk do Scryfall
   build.rs    bulk -> data/cards.json
   card.rs     structs RawCard (Scryfall) e Card (dataset)
@@ -204,7 +245,9 @@ src/
   deck.rs     sugestões por categoria para Commander
 tests/
   golden_cards.json   regressão: 68 cartas com as tags obrigatórias e proibidas
-  mcp_e2e.rs          sobe o servidor MCP real e testa as 5 ferramentas (pulado sem data/)
+  mcp_e2e.rs          sobe o servidor MCP real e testa as 9 ferramentas (pulado sem data/)
+docs/
+  MagicCompRules-20261106.pdf   Comprehensive Rules oficiais (Wizards), para conferir uma regra pelo número
 ```
 
 **Ao mudar uma regra de classificação:**
@@ -218,6 +261,6 @@ tests/
 <sub>
 Dados das cartas: <a href="https://scryfall.com/docs/api/bulk-data">Scryfall</a>.
 Projeto não oficial, sem afiliação com a Wizards of the Coast.<br>
-Magic: The Gathering, os nomes, textos e artes das cartas (inclusive a do banner) são © Wizards of the Coast LLC.
+Magic: The Gathering, os nomes, textos e artes das cartas (inclusive a do banner) e as Comprehensive Rules são © Wizards of the Coast LLC.
 </sub>
 </div>
