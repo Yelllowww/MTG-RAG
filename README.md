@@ -149,9 +149,9 @@ Qualquer cliente MCP (Claude Code, Claude Desktop, Cursor...) passa a ter estas 
 | ferramenta | o que faz |
 |---|---|
 | `search_cards` | busca com texto + todos os filtros e tags do `search` |
-| `get_card` | ficha completa; se o nome não existir, sugere parecidos (*"tortex" → Tortured Existence*) |
+| `get_card` | ficha completa; ignora acentos e apóstrofos (*Lim-Dul's Vault*, *Thassa’s Oracle*) e, se o nome não existir, sugere parecidos (*"tortex" → Tortured Existence*) |
 | `suggest_deck` | sugestões por seção para um comandante |
-| `validate_deck` | confere a lista: cartas inexistentes, legalidade, cópias, identidade de cor, contagem, Game Changers, preço e curva |
+| `validate_deck` | confere a lista: cartas inexistentes (com sugestão), legalidade, cópias (inclusive restritas e Seven Dwarves), identidade de cor, contagem, Game Changers, orçamento por carta, preço e curva. Aceita listas do Arena, MTGO (`SB:`) e Moxfield |
 | `list_tags` | a taxonomia com significado e quantidade de cartas |
 
 As cartas e o índice ficam carregados na memória: depois do primeiro segundo, cada consulta é instantânea.
@@ -204,6 +204,7 @@ src/
   deck.rs     sugestões por categoria para Commander
 tests/
   golden_cards.json   regressão: 68 cartas com as tags obrigatórias e proibidas
+  mcp_e2e.rs          sobe o servidor MCP real e testa as 5 ferramentas (pulado sem data/)
 ```
 
 **Ao mudar uma regra de classificação:**

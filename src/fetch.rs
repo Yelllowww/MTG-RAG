@@ -15,7 +15,7 @@ use std::path::Path;
 
 const BULK_INFO: &str = "https://api.scryfall.com/bulk-data/oracle-cards";
 // O Scryfall exige User-Agent e Accept em toda requisição.
-const USER_AGENT: &str = "magic_rag/0.3 (local card search prototype)";
+const USER_AGENT: &str = "magic_rag/0.3.1 (local card search prototype)";
 
 #[derive(Deserialize)]
 struct BulkInfo {

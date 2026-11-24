@@ -132,6 +132,10 @@ pub struct Card {
     pub set_name: String,
     pub released_at: String,
     pub legal_formats: Vec<String>,
+    /// formatos em que a carta é restrita (máx. 1 cópia), ex. Black Lotus no vintage.
+    /// Também aparecem em legal_formats.
+    #[serde(default)]
+    pub restricted_formats: Vec<String>,
     pub edhrec_rank: Option<u32>,
     pub game_changer: bool,
     pub reserved: bool,

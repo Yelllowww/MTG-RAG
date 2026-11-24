@@ -163,6 +163,9 @@ pub fn run(input: &str, output: &str) -> Result<(), Box<dyn Error>> {
             .map(|(k, _)| k.clone())
             .collect();
         legal_formats.sort();
+        let mut restricted_formats: Vec<String> =
+            c.legalities.iter().filter(|(_, v)| *v == "restricted").map(|(k, _)| k.clone()).collect();
+        restricted_formats.sort();
 
         let colors = c.colors.clone().unwrap_or_else(|| {
             // cartas de várias faces só têm cores por face; a identidade cobre o resto
@@ -221,6 +224,7 @@ pub fn run(input: &str, output: &str) -> Result<(), Box<dyn Error>> {
             set_name: c.set_name,
             released_at: c.released_at,
             legal_formats,
+            restricted_formats,
             edhrec_rank: c.edhrec_rank,
             game_changer: c.game_changer,
             reserved: c.reserved,

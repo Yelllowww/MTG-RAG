@@ -371,10 +371,28 @@ fn validate_tags<'a>(tags: impl Iterator<Item = &'a String>) -> Result<(), Strin
             cat.is_none_or(|x| x == *c) && list.iter().any(|(n, _)| *n == name)
         });
         if !ok {
-            return Err(format!("tag desconhecida: {t} (veja: magic_rag tags)"));
+            let similar = similar_tags(name);
+            let hint = if similar.is_empty() { String::new() } else { format!(" Você quis dizer: {}?", similar.join(", ")) };
+            return Err(format!("tag desconhecida: {t}.{hint} (lista completa: list_tags / magic_rag tags)"));
         }
     }
     Ok(())
+}
+
+/// Tags parecidas com um nome errado: "haste" -> haste_enabler, "removel" -> removal.
+fn similar_tags(name: &str) -> Vec<String> {
+    let all = tags::TAXONOMY.iter().flat_map(|(c, l)| l.iter().map(move |(n, _)| (*c, *n)));
+    let mut scored: Vec<(usize, String)> = all
+        .filter_map(|(cat, tag)| {
+            let shared = tag.chars().zip(name.chars()).take_while(|(a, b)| a == b).count();
+            let contains = tag.contains(name) || name.contains(tag);
+            let parts = tag.split('_').any(|p| p.len() >= 3 && name.contains(p));
+            let score = if contains { 100 } else { 0 } + if parts { 50 } else { 0 } + if shared >= 4 { shared } else { 0 };
+            (score > 0).then(|| (score, format!("{cat}:{tag}")))
+        })
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    scored.into_iter().take(3).map(|(_, t)| t).collect()
 }
 
 // ---------------------------------------------------------------- saída

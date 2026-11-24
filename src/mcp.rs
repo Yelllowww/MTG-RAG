@@ -14,7 +14,7 @@ use crate::search::{self, Index, Query, Sort};
 use crate::{deck, tags};
 use regex::Regex;
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{self, BufRead, Write};
 use std::sync::OnceLock;
 
@@ -24,6 +24,15 @@ const DEFAULT_PROTOCOL: &str = "2025-06-18";
 struct Db {
     cards: Vec<Card>,
     index: Index,
+    /// nome normalizado (e de cada face) -> posição em `cards`: busca exata O(1)
+    by_name: HashMap<String, usize>,
+}
+
+impl Db {
+    /// Carta com este nome exato (ignora maiúsculas, acentos, apóstrofos; aceita nome de uma face).
+    fn exact(&self, name: &str) -> Option<&Card> {
+        self.by_name.get(&search::norm_name(name)).map(|&i| &self.cards[i])
+    }
 }
 
 static DB: OnceLock<Result<Db, String>> = OnceLock::new();
@@ -33,8 +42,23 @@ fn db() -> Result<&'static Db, String> {
         let t = std::time::Instant::now();
         let cards = crate::load_cards().map_err(|e| e.to_string())?;
         let index = Index::new(&cards);
+        // `cards` está em ordem de popularidade. Percorrendo de trás para frente e
+        // sobrescrevendo, quem fica no índice é a carta mais jogada. Primeiro os nomes de
+        // face, depois os nomes completos, para um nome completo sempre ganhar de uma face
+        // ("Fire" é face de Fire // Ice e de Start // Fire: fica Fire // Ice).
+        let mut by_name = HashMap::new();
+        for (i, c) in cards.iter().enumerate().rev() {
+            if c.name.contains(" // ") {
+                for face in c.name.split(" // ") {
+                    by_name.insert(search::norm_name(face), i);
+                }
+            }
+        }
+        for (i, c) in cards.iter().enumerate().rev() {
+            by_name.insert(search::norm_name(&c.name), i);
+        }
         eprintln!("[mtg-rag] {} cartas carregadas em {:.1}s", cards.len(), t.elapsed().as_secs_f64());
-        Ok(Db { cards, index })
+        Ok(Db { cards, index, by_name })
     })
     .as_ref()
     .map_err(|e| e.clone())
@@ -125,7 +149,9 @@ Sem 'query', ordena por popularidade no EDHREC. Para achar cartas por função, 
                 "properties": {
                     "decklist": {"type": "string", "description": "A lista, uma carta por linha."},
                     "format": {"type": "string", "description": "Formato: commander, pauper, modern, standard, legacy, brawl..."},
-                    "commander": {"type": "string", "description": "Comandante (ou dois parceiros separados por ' + '). Fica fora da contagem da lista."}
+                    "commander": {"type": "string", "description": "Comandante (ou dois parceiros separados por ' + '). Fica fora da contagem da lista."},
+                    "price_max": {"type": "number", "description": "Orçamento por carta em dólares: aponta as cartas acima dele (terrenos básicos e comandantes não contam) e as sem preço."},
+                    "no_game_changers": {"type": "boolean", "description": "Trata Game Changers como problema (brackets 1-3 de Commander)."}
                 },
                 "required": ["decklist", "format"]
             },
@@ -146,11 +172,24 @@ Sem 'query', ordena por popularidade no EDHREC. Para achar cartas por função, 
 fn s(a: &Value, k: &str) -> Option<String> {
     a.get(k).and_then(Value::as_str).map(str::trim).filter(|x| !x.is_empty()).map(String::from)
 }
+// LLMs às vezes mandam números e booleanos como texto ("5", "true"): aceitamos os dois.
 fn n(a: &Value, k: &str) -> Option<f64> {
-    a.get(k).and_then(Value::as_f64)
+    match a.get(k)? {
+        Value::Number(x) => x.as_f64(),
+        Value::String(x) => x.trim().replace(',', ".").parse().ok(),
+        _ => None,
+    }
+}
+fn u(a: &Value, k: &str) -> Option<u64> {
+    n(a, k).filter(|x| *x >= 0.0).map(|x| x as u64)
 }
 fn b(a: &Value, k: &str) -> bool {
-    a.get(k).and_then(Value::as_bool).unwrap_or(false)
+    match a.get(k) {
+        Some(Value::Bool(x)) => *x,
+        Some(Value::String(x)) => matches!(x.trim().to_lowercase().as_str(), "true" | "1" | "yes" | "sim"),
+        Some(Value::Number(x)) => x.as_f64() == Some(1.0),
+        _ => false,
+    }
 }
 fn list(a: &Value, k: &str) -> Vec<String> {
     match a.get(k) {
@@ -193,7 +232,7 @@ fn search_cards(db: &Db, a: &Value) -> Result<Value, String> {
         price_max: n(a, "price_max"),
         paper: b(a, "paper"),
         no_game_changers: b(a, "no_game_changers"),
-        top: a.get("limit").and_then(Value::as_u64).unwrap_or(10).clamp(1, 50) as usize,
+        top: u(a, "limit").unwrap_or(10).clamp(1, 50) as usize,
         sort: Sort::default(),
     };
     if let Some(so) = s(a, "sort") {
@@ -209,7 +248,10 @@ fn search_cards(db: &Db, a: &Value) -> Result<Value, String> {
 
 fn get_card(db: &Db, a: &Value) -> Result<Value, String> {
     let name = s(a, "name").ok_or("informe 'name'")?;
-    let found = search::find_by_name(&db.cards, &name);
+    let found = match db.exact(&name) {
+        Some(c) => vec![c],
+        None => search::find_by_name(&db.cards, &name),
+    };
     if found.is_empty() {
         return Ok(json!({"found": 0, "cards": [], "suggestions": suggest_names(db, &name)}));
     }
@@ -221,13 +263,19 @@ fn get_card(db: &Db, a: &Value) -> Result<Value, String> {
 
 /// Nomes parecidos para quando o nome não existe ("Tortex" -> "Tortured Existence").
 fn suggest_names(db: &Db, name: &str) -> Vec<String> {
-    let low = name.to_lowercase();
-    let words: Vec<&str> = low.split_whitespace().filter(|w| w.len() >= 3).collect();
+    // palavras genéricas de nome de carta não contam ("Gurmag the Destroyer" não deve
+    // sugerir "Thomil, the Destroyer" na frente das cartas "Gurmag")
+    const GENERIC: &[&str] = &["the", "of", "and", "from", "for", "with", "into", "a", "an"];
+    let low = search::norm_name(name);
+    let words: Vec<&str> = low
+        .split(|ch: char| !ch.is_alphanumeric() && ch != '\'' && ch != '-')
+        .filter(|w| w.len() >= 3 && !GENERIC.contains(w))
+        .collect();
     let mut scored: Vec<(usize, u32, &str)> = db
         .cards
         .iter()
         .filter_map(|c| {
-            let cn = c.name.to_lowercase();
+            let cn = search::norm_name(&c.name);
             // palavras inteiras em comum + prefixo comum (pega apelidos como "tortex")
             let common = words.iter().filter(|w| cn.contains(*w)).count();
             let prefix = cn.chars().zip(low.chars()).take_while(|(x, y)| x == y).count();
@@ -242,7 +290,7 @@ fn suggest_names(db: &Db, name: &str) -> Vec<String> {
 fn suggest_deck(db: &Db, a: &Value) -> Result<Value, String> {
     let commander = s(a, "commander").ok_or("informe 'commander'")?;
     let o = deck::DeckOpts {
-        per: a.get("per_section").and_then(Value::as_u64).unwrap_or(8).clamp(1, 30) as usize,
+        per: u(a, "per_section").unwrap_or(8).clamp(1, 30) as usize,
         budget: n(a, "budget"),
         no_game_changers: b(a, "no_game_changers"),
         extra_tags: list(a, "extra_tags"),
@@ -270,19 +318,82 @@ fn money(x: f64) -> f64 {
 
 const SINGLETON: &[&str] = &["commander", "brawl", "standardbrawl", "oathbreaker", "paupercommander", "duel", "predh", "gladiator"];
 
+/// Uma linha de lista de deck já interpretada.
+#[derive(Debug, PartialEq)]
+enum DeckLine {
+    Skip,
+    /// cabeçalho de seção: true = sideboard
+    Section(bool),
+    /// (quantidade, nome, esta linha é de sideboard por prefixo "SB:")
+    Card(u32, String, bool),
+}
+
+/// Entende os formatos comuns: "4 Bolt", "4x Bolt", "Bolt", Arena "4 Bolt (M10) 146",
+/// MTGO "SB: 2 Duress", Moxfield "1 Sol Ring (C21) 263 *F*" / "*CMDR*", cabeçalhos e comentários.
+fn parse_deck_line(raw: &str) -> DeckLine {
+    static RE: OnceLock<(Regex, Regex)> = OnceLock::new();
+    let (card_re, marker_re) = RE.get_or_init(|| {
+        (
+            Regex::new(r"^(?:(\d+)\s*x?\s+)?(.+?)(?:\s+[\(\[][A-Za-z0-9]{2,6}[\)\]](?:\s+\S+)?)?\s*$").unwrap(),
+            Regex::new(r"\s+\*[A-Za-z]+\*").unwrap(),
+        )
+    });
+    let mut line = raw.trim();
+    let low = line.to_lowercase();
+    if line.is_empty() || line.starts_with('#') || line.starts_with("//") {
+        return if low.contains("sideboard") { DeckLine::Section(true) } else { DeckLine::Skip };
+    }
+    match low.trim_end_matches(':').trim() {
+        "sideboard" | "side" => return DeckLine::Section(true),
+        "deck" | "main" | "maindeck" | "main deck" | "commander" | "companion" | "about" => return DeckLine::Section(false),
+        _ => {}
+    }
+    let mut side = false;
+    if low.starts_with("sb:") {
+        side = true;
+        line = line[3..].trim();
+    }
+    let cleaned = marker_re.replace_all(line, "");
+    let Some(cap) = card_re.captures(cleaned.trim()) else { return DeckLine::Skip };
+    let qty = cap.get(1).map_or(1, |m| m.as_str().parse().unwrap_or(1));
+    DeckLine::Card(qty, cap[2].trim().to_string(), side)
+}
+
+/// Máximo de cópias da carta no formato. None = ilimitado.
+fn copy_limit(c: &Card, format: &str, singleton: bool) -> Option<u32> {
+    let text = c.oracle_text.to_lowercase();
+    if c.supertypes.iter().any(|t| t == "Basic") || text.contains("a deck can have any number of cards named") {
+        return None;
+    }
+    // "A deck can have up to seven cards named Seven Dwarves."
+    if let Some(rest) = text.split("a deck can have up to ").nth(1) {
+        let word = rest.split_whitespace().next().unwrap_or("");
+        let n = match word {
+            "two" => 2, "three" => 3, "four" => 4, "five" => 5, "six" => 6, "seven" => 7,
+            "eight" => 8, "nine" => 9, "ten" => 10, w => w.parse().unwrap_or(4),
+        };
+        return Some(n);
+    }
+    if singleton || c.restricted_formats.iter().any(|f| f == format) {
+        return Some(1);
+    }
+    Some(4)
+}
+
 fn validate_deck(db: &Db, a: &Value) -> Result<Value, String> {
     let text = s(a, "decklist").ok_or("informe 'decklist'")?;
     let format = s(a, "format").ok_or("informe 'format'")?.to_lowercase();
+    let known: std::collections::BTreeSet<&str> =
+        db.cards.iter().flat_map(|c| c.legal_formats.iter().map(String::as_str)).collect();
+    if !known.contains(format.as_str()) {
+        return Err(format!(
+            "formato desconhecido: '{format}'. Formatos válidos: {}",
+            known.into_iter().collect::<Vec<_>>().join(", ")
+        ));
+    }
     let singleton = SINGLETON.contains(&format.as_str());
-    let line_re = Regex::new(r"^(?:(\d+)\s*x?\s+)?(.+?)(?:\s+\([A-Za-z0-9]{2,6}\)(?:\s+\S+)?)?\s*$").unwrap();
 
-    let find = |name: &str| -> Option<&Card> {
-        let hits = search::find_by_name(&db.cards, name);
-        hits.first().copied().filter(|c| {
-            let l = name.to_lowercase();
-            c.name.to_lowercase() == l || c.name.to_lowercase().split(" // ").any(|f| f == l)
-        })
-    };
+    let find = |name: &str| -> Option<&Card> { db.exact(name) };
 
     // comandante(s)
     let mut commanders: Vec<&Card> = vec![];
@@ -314,33 +425,21 @@ fn validate_deck(db: &Db, a: &Value) -> Result<Value, String> {
     let mut side: BTreeMap<String, (u32, &Card)> = BTreeMap::new();
     let mut in_side = false;
     for raw in text.lines() {
-        let line = raw.trim();
-        let low = line.to_lowercase();
-        if line.is_empty() || line.starts_with('#') || line.starts_with("//") {
-            if low.contains("sideboard") {
-                in_side = true;
-            }
-            continue;
-        }
-        match low.trim_end_matches(':') {
-            "sideboard" | "side" => { in_side = true; continue; }
-            "deck" | "main" | "maindeck" | "main deck" | "commander" | "companion" => { in_side = false; continue; }
-            _ => {}
-        }
-        let Some(cap) = line_re.captures(line) else { continue };
-        let qty: u32 = cap.get(1).map_or(1, |m| m.as_str().parse().unwrap_or(1));
-        let name = cap[2].trim();
-        match find(name) {
+        let (qty, name, sb) = match parse_deck_line(raw) {
+            DeckLine::Skip => continue,
+            DeckLine::Section(s) => { in_side = s; continue; }
+            DeckLine::Card(q, n, sb) => (q, n, sb),
+        };
+        match find(&name) {
             Some(c) => {
-                let slot = if in_side { &mut side } else { &mut main };
+                let slot = if in_side || sb { &mut side } else { &mut main };
                 slot.entry(c.name.clone()).or_insert((0, c)).0 += qty;
             }
-            None => unknown.push(json!({"name": name, "suggestions": suggest_names(db, name)})),
+            None => unknown.push(json!({"name": name, "suggestions": suggest_names(db, &name)})),
         }
     }
 
     // regras
-    let max_copies = if singleton { 1 } else { 4 };
     let mut totals: BTreeMap<String, (u32, &Card)> = BTreeMap::new();
     for (k, (q, c)) in main.iter().chain(side.iter()) {
         totals.entry(k.clone()).or_insert((0, c)).0 += q;
@@ -354,9 +453,11 @@ fn validate_deck(db: &Db, a: &Value) -> Result<Value, String> {
         if !c.is_legal(&format) {
             illegal.push(name.clone());
         }
-        let unlimited = c.supertypes.iter().any(|t| t == "Basic") || c.oracle_text.to_lowercase().contains("a deck can have any number of cards named");
-        if !unlimited && *q > max_copies && !c.oracle_text.to_lowercase().contains("a deck can have up to") {
-            problems.push(format!("{name}: {q} cópias (máximo {max_copies} em {format})"));
+        if let Some(max) = copy_limit(c, &format, singleton)
+            && *q > max
+        {
+            let why = if c.restricted_formats.contains(&format) { " — restrita" } else { "" };
+            problems.push(format!("{name}: {q} cópias (máximo {max} em {format}{why})"));
         }
         if let Some(id) = &identity
             && !c.color_identity.iter().all(|x| id.contains(x)) {
@@ -406,6 +507,24 @@ fn validate_deck(db: &Db, a: &Value) -> Result<Value, String> {
         }
     }
     let game_changers: Vec<&String> = totals.iter().filter(|(_, (_, c))| c.game_changer).map(|(n, _)| n).collect();
+    if b(a, "no_game_changers") && !game_changers.is_empty() {
+        problems.push(format!("Game Changers (pedido sem): {}", game_changers.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")));
+    }
+    if let Some(limit) = n(a, "price_max") {
+        let is_cmd = |c: &Card| commanders.iter().any(|x| x.oracle_id == c.oracle_id);
+        let mut over: Vec<(String, f64)> = totals
+            .values()
+            .filter(|(_, c)| !c.supertypes.iter().any(|t| t == "Basic") && !is_cmd(c))
+            .filter_map(|(_, c)| c.price_usd.filter(|p| *p > limit).map(|p| (c.name.clone(), p)))
+            .collect();
+        over.sort_by(|x, y| y.1.total_cmp(&x.1));
+        if !over.is_empty() {
+            problems.push(format!(
+                "acima do orçamento de US${limit:.2} por carta: {}",
+                over.iter().map(|(n, p)| format!("{n} (US${p:.2})")).collect::<Vec<_>>().join(", ")
+            ));
+        }
+    }
 
     Ok(json!({
         "valid": problems.is_empty(),
@@ -558,6 +677,56 @@ mod tests {
         assert_eq!(r["error"]["code"], -32601);
         let r = handle(&json!({"jsonrpc": "2.0", "id": 10, "method": "ping"})).unwrap();
         assert_eq!(r["result"], json!({}));
+    }
+
+    #[test]
+    fn parses_common_decklist_formats() {
+        use DeckLine::*;
+        let card = |q, n: &str, sb| Card(q, n.to_string(), sb);
+        assert_eq!(parse_deck_line("4 Lightning Bolt"), card(4, "Lightning Bolt", false));
+        assert_eq!(parse_deck_line("4x Lightning Bolt"), card(4, "Lightning Bolt", false));
+        assert_eq!(parse_deck_line("Sol Ring"), card(1, "Sol Ring", false));
+        assert_eq!(parse_deck_line("4 Lightning Bolt (M10) 146"), card(4, "Lightning Bolt", false));
+        assert_eq!(parse_deck_line("1 Sol Ring (C21) 263 *F*"), card(1, "Sol Ring", false));
+        assert_eq!(parse_deck_line("1 Atraxa, Praetors' Voice *CMDR*"), card(1, "Atraxa, Praetors' Voice", false));
+        assert_eq!(parse_deck_line("SB: 2 Duress"), card(2, "Duress", true));
+        assert_eq!(parse_deck_line("1 Fire // Ice"), card(1, "Fire // Ice", false));
+        assert_eq!(parse_deck_line("Sideboard"), Section(true));
+        assert_eq!(parse_deck_line("SIDEBOARD:"), Section(true));
+        assert_eq!(parse_deck_line("# SIDEBOARD"), Section(true));
+        assert_eq!(parse_deck_line("Deck"), Section(false));
+        assert_eq!(parse_deck_line("# Ramp"), Skip);
+        assert_eq!(parse_deck_line("   "), Skip);
+    }
+
+    fn mk(name: &str, supertypes: &[&str], text: &str, restricted: &[&str]) -> crate::card::Card {
+        serde_json::from_value(json!({
+            "oracle_id": "", "name": name, "layout": "normal", "mana_cost": "", "cmc": 0.0, "type_line": "",
+            "supertypes": supertypes, "types": [], "subtypes": [], "colors": [], "color_identity": [],
+            "keywords": [], "power": null, "toughness": null, "loyalty": null, "defense": null,
+            "produced_mana": [], "rarity": "common", "set": "", "set_name": "", "released_at": "",
+            "legal_formats": ["vintage", "legacy"], "restricted_formats": restricted, "edhrec_rank": null,
+            "game_changer": false, "reserved": false, "digital_only": false, "funny": false,
+            "can_be_commander": false, "instant_speed": false, "price_usd": null, "price_eur": null,
+            "oracle_text": text, "tags": {"function": [], "trigger": [], "target": [], "theme": []},
+            "tribes": [], "scryfall_uri": null, "image": null, "search_text": ""
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn copy_limits() {
+        let bolt = mk("Lightning Bolt", &[], "Lightning Bolt deals 3 damage to any target.", &[]);
+        assert_eq!(copy_limit(&bolt, "legacy", false), Some(4));
+        assert_eq!(copy_limit(&bolt, "commander", true), Some(1));
+        let lotus = mk("Black Lotus", &[], "{T}, Sacrifice Black Lotus: Add three mana of any one color.", &["vintage"]);
+        assert_eq!(copy_limit(&lotus, "vintage", false), Some(1));
+        let swamp = mk("Snow-Covered Swamp", &["Basic", "Snow"], "({T}: Add {B}.)", &[]);
+        assert_eq!(copy_limit(&swamp, "modern", false), None);
+        let rats = mk("Relentless Rats", &[], "A deck can have any number of cards named Relentless Rats.", &[]);
+        assert_eq!(copy_limit(&rats, "commander", true), None);
+        let dwarves = mk("Seven Dwarves", &[], "Seven Dwarves gets +1/+1 for each other creature named Seven Dwarves you control.\nA deck can have up to seven cards named Seven Dwarves.", &[]);
+        assert_eq!(copy_limit(&dwarves, "legacy", false), Some(7));
     }
 
     #[test]

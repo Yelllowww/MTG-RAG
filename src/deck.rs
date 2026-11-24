@@ -157,7 +157,7 @@ mod tests {
             colors: vec![], color_identity: vec![], keywords: vec![], power: None, toughness: None,
             loyalty: None, defense: None, produced_mana: mana.iter().map(|s| s.to_string()).collect(),
             rarity: "rare".into(), set: String::new(), set_name: String::new(), released_at: String::new(),
-            legal_formats: vec![], edhrec_rank: None, game_changer: false, reserved: false,
+            legal_formats: vec![], restricted_formats: vec![], edhrec_rank: None, game_changer: false, reserved: false,
             digital_only: false, funny: false, can_be_commander: false, instant_speed: false,
             price_usd: None, price_eur: None, oracle_text: text.into(), tags: Tags::default(), tribes: vec![],
             scryfall_uri: None, image: None, search_text: String::new(),

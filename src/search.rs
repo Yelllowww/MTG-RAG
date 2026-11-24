@@ -243,18 +243,49 @@ pub fn search<'a>(cards: &'a [Card], index: &Index, q: &Query) -> Vec<Hit<'a>> {
     hits
 }
 
+/// Forma canônica de um nome para comparar: minúsculas, sem espaços nas pontas, sem
+/// acentos/ligaduras ("Lim-Dûl" = "Lim-Dul", "Æther" = "Aether") e com apóstrofos e
+/// aspas tipográficos trocados pelos simples ("Thassa’s" = "Thassa's").
+pub fn norm_name(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.trim().chars().flat_map(char::to_lowercase) {
+        match ch {
+            'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' => out.push('a'),
+            'ç' => out.push('c'),
+            'è' | 'é' | 'ê' | 'ë' => out.push('e'),
+            'ì' | 'í' | 'î' | 'ï' => out.push('i'),
+            'ñ' => out.push('n'),
+            'ò' | 'ó' | 'ô' | 'õ' | 'ö' | 'ø' => out.push('o'),
+            'ù' | 'ú' | 'û' | 'ü' => out.push('u'),
+            'ý' | 'ÿ' => out.push('y'),
+            'æ' => out.push_str("ae"),
+            'œ' => out.push_str("oe"),
+            'ß' => out.push_str("ss"),
+            '’' | '‘' | '`' | '´' => out.push('\''),
+            '“' | '”' => out.push('"'),
+            '\u{a0}' => out.push(' '),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// O nome bate exatamente com a carta ou com uma das faces dela?
+pub fn name_matches(card: &Card, name: &str) -> bool {
+    let n = norm_name(name);
+    let cn = norm_name(&card.name);
+    cn == n || cn.split(" // ").any(|f| f == n)
+}
+
 /// Acha uma carta pelo nome: exato (sem diferenciar maiúsculas), depois prefixo, depois "contém".
 pub fn find_by_name<'a>(cards: &'a [Card], name: &str) -> Vec<&'a Card> {
-    let n = name.trim().to_lowercase();
-    let exact: Vec<&Card> = cards
-        .iter()
-        .filter(|c| c.name.to_lowercase() == n || c.name.to_lowercase().split(" // ").any(|f| f == n))
-        .collect();
+    let n = norm_name(name);
+    let exact: Vec<&Card> = cards.iter().filter(|c| name_matches(c, &n)).collect();
     if !exact.is_empty() {
         return exact;
     }
-    let mut part: Vec<&Card> = cards.iter().filter(|c| c.name.to_lowercase().contains(&n)).collect();
-    part.sort_by_key(|c| (!c.name.to_lowercase().starts_with(&n), rank(c)));
+    let mut part: Vec<&Card> = cards.iter().filter(|c| norm_name(&c.name).contains(&n)).collect();
+    part.sort_by_key(|c| (!norm_name(&c.name).starts_with(&n), rank(c)));
     part
 }
 
@@ -268,6 +299,15 @@ mod tests {
         assert_eq!(t.tokenize("creatures dies"), t.tokenize("creature died"));
         assert_eq!(t.tokenize("draws cards"), t.tokenize("draw card"));
         assert!(t.tokenize("{T}: Add {G}").contains(&"{t}".to_string()));
+    }
+
+    #[test]
+    fn typographic_apostrophes_are_normalized() {
+        assert_eq!(norm_name("  Thassa’s Oracle "), "thassa's oracle");
+        assert_eq!(norm_name("Thassa‘s Oracle"), norm_name("Thassa's Oracle"));
+        assert_eq!(norm_name("Lim-Dûl's Vault"), norm_name("Lim-Dul's Vault"));
+        assert_eq!(norm_name("Æther Vial"), "aether vial");
+        assert_eq!(norm_name("Jötun Grunt"), "jotun grunt");
     }
 
     #[test]
