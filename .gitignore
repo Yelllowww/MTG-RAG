@@ -1,0 +1,6 @@
+# build do Rust
+/target
+
+# dataset: não vai para o repositório, é gerado com `magic_rag install`
+/data/
+*.part
